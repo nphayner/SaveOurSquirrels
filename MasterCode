@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 
 # --- Save directories ---
 IMG_DIR = "/home/sos/Pictures"
-VID_DIR = "/home/sos/Videos"
+VID_DIR = "/home/sos/Pictures"
 BUF_DIR = "/tmp/video_buffer"
 os.makedirs(IMG_DIR, exist_ok=True)
 os.makedirs(VID_DIR, exist_ok=True)
@@ -72,9 +72,9 @@ def get_image_filename():
 def send_email_notification():
     port = 587
     smtp_server = "smtp.gmail.com"
-    sender_email = "sos545606@gmail.com"
-    password = "uldo lhqy thou pehr"
-    receiver_email = "carter4704@gmail.com"
+    sender_email = "senderEmail"            // Replace with email of sender
+    password = "password"                    //  Replace with password to sending email account
+    receiver_email = "receiverEmail"            // Replace with email of recipient
     subject = "Subject: ALERT: Animal Detected\n"
     body = "Animal detected in substation. Check synced OneDrive folder for details."
 
