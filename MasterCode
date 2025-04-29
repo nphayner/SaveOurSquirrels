@@ -1,0 +1,215 @@
+import os
+import time
+import logging
+import threading
+import subprocess
+import numpy as np
+import cv2 as cv
+from smbus import SMBus
+from spidev import SpiDev
+from gpiozero import DigitalInputDevice, DigitalOutputDevice
+from datetime import datetime
+from senxor.mi48 import MI48
+from senxor.utils import data_to_frame
+from senxor.interfaces import SPI_Interface, I2C_Interface
+from scipy.ndimage import label
+import smtplib, ssl
+
+# --- Logging ---
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# --- Save directories ---
+IMG_DIR = "/home/sos/Pictures"
+VID_DIR = "/home/sos/Videos"
+BUF_DIR = "/tmp/video_buffer"
+os.makedirs(IMG_DIR, exist_ok=True)
+os.makedirs(VID_DIR, exist_ok=True)
+os.makedirs(BUF_DIR, exist_ok=True)
+
+# --- Thermal Camera Setup ---
+i2c = I2C_Interface(SMBus(1), 0x40)
+spi = SPI_Interface(SpiDev(0, 0), xfer_size=160)
+spi.device.mode = 0b00
+spi.device.max_speed_hz = 31200000
+spi.cshigh = True
+spi.no_cs = True
+
+mi48_spi_cs_n = DigitalOutputDevice("BCM7", active_high=False, initial_value=False)
+mi48_reset_n = DigitalOutputDevice("BCM23", active_high=False, initial_value=True)
+mi48_data_ready = DigitalInputDevice("BCM24", pull_up=False)
+
+class MI48_reset:
+    def __init__(self, pin, assert_seconds=0.000035, deassert_seconds=0.050):
+        self.pin = pin
+        self.assert_time = assert_seconds
+        self.deassert_time = deassert_seconds
+    def __call__(self):
+        self.pin.on(); time.sleep(self.assert_time)
+        self.pin.off(); time.sleep(self.deassert_time)
+
+mi48 = MI48([i2c, spi], reset_handler=MI48_reset(mi48_reset_n))
+mi48.set_fps(7)
+time.sleep(2)
+mi48.start(stream=True, with_header=True)
+
+# --- GPIO Setup ---
+pins = {
+    5: DigitalInputDevice(5),
+    6: DigitalInputDevice(6),
+    22: DigitalInputDevice(22),
+    27: DigitalInputDevice(27)
+}
+
+# --- Video buffer trigger flag ---
+triggered = threading.Event()
+
+# --- Filename helper ---
+def get_image_filename():
+    return os.path.join(IMG_DIR, f"thermal_{time.strftime('%Y%m%d-%H%M%S')}.png")
+
+# --- Send email ---
+def send_email_notification():
+    port = 587
+    smtp_server = "smtp.gmail.com"
+    sender_email = "sos545606@gmail.com"
+    password = "uldo lhqy thou pehr"
+    receiver_email = "carter4704@gmail.com"
+    subject = "Subject: ALERT: Animal Detected\n"
+    body = "Animal detected in substation. Check synced OneDrive folder for details."
+
+    message = subject + "\n" + body
+    context = ssl.create_default_context()
+
+    try:
+        with smtplib.SMTP(smtp_server, port) as server:
+            server.starttls(context=context)
+            server.login(sender_email, password)
+            server.sendmail(sender_email, receiver_email, message)
+            logger.info("Email sent successfully.")
+    except Exception as e:
+        logger.error(f"Error sending email: {e}")
+
+# --- Sync to OneDrive ---
+def sync_to_onedrive():
+    try:
+        subprocess.run(["rclone", "sync", "-v", "/home/sos/Pictures", "onedrive:Data"], check=True)
+        logger.info("OneDrive sync complete.")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"OneDrive sync failed: {e}")
+
+# --- Thermal image capture with analysis ---
+def capture_thermal_image():
+    mi48_data_ready.wait_for_active()
+    mi48_spi_cs_n.on(); time.sleep(0.0001)
+    data, header = mi48.read()
+    mi48_spi_cs_n.off()
+
+    if data is None:
+        logger.error("No data from MI48 camera")
+        return
+
+    imgh = data_to_frame(data, mi48.fpa_shape)
+    img8u = cv.normalize(imgh.astype('uint8'), None, 255, 0, norm_type=cv.NORM_MINMAX, dtype=cv.CV_8U)
+    img8u = cv.applyColorMap(img8u, cv.COLORMAP_JET)
+
+    filename = get_image_filename()
+    cv.imwrite(filename, img8u)
+    logger.info(f"Saved thermal image: {filename}")
+
+    # --- IMAGE ANALYSIS ---
+    img = cv.imread(filename)
+    red_channel = img[:, :, 2]
+    green_channel = img[:, :, 1]
+    animal = (red_channel > 160) & (green_channel < 70)
+
+    BW = animal.astype(np.uint8)
+    BW_filled = cv.morphologyEx(BW, cv.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    labeled_array, num_features = label(BW_filled)
+    area = np.sum(BW_filled)
+
+    logger.info(f"Detected heat blob area: {area}")
+    if area > 50:
+        logger.info("Animal detected! Sending alert and syncing to OneDrive...")
+        send_email_notification()
+        sync_to_onedrive()
+    else:
+        logger.info("No animal detected.")
+
+# --- Video buffering and merging ---
+def video_buffer_loop():
+    env = os.environ.copy()
+
+    while True:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        h264_temp1 = os.path.join(BUF_DIR, f"temp1_{timestamp}.h264")
+        mp4_temp1 = os.path.join(BUF_DIR, f"temp1_{timestamp}.mp4")
+        h264_temp2 = os.path.join(BUF_DIR, f"temp2_{timestamp}.h264")
+        mp4_temp2 = os.path.join(BUF_DIR, f"temp2_{timestamp}.mp4")
+        merged_output = os.path.join(VID_DIR, f"video_{timestamp}.mp4")
+
+        triggered.clear()
+        subprocess.run(["libcamera-vid", "-t", "5000", "--width", "1920", "--height", "1080",
+                        "--framerate", "30", "-n", "-o", h264_temp1], env=env)
+
+        if triggered.is_set():
+            subprocess.run(["ffmpeg", "-y", "-fflags", "+genpts", "-r", "30",
+                            "-i", h264_temp1, "-c:v", "copy", mp4_temp1],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+
+            subprocess.run(["libcamera-vid", "-t", "5000", "--width", "1920", "--height", "1080",
+                            "--framerate", "30", "-n", "-o", h264_temp2], env=env)
+
+            subprocess.run(["ffmpeg", "-y", "-fflags", "+genpts", "-r", "30",
+                            "-i", h264_temp2, "-c:v", "copy", mp4_temp2],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+
+            concat_file = os.path.join(BUF_DIR, "concat.txt")
+            with open(concat_file, "w") as f:
+                f.write(f"file '{mp4_temp1}'\nfile '{mp4_temp2}'\n")
+
+            subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                            "-i", concat_file, "-c", "copy", merged_output],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+
+            logger.info(f"Saved merged video: {merged_output}")
+            for f in [h264_temp1, mp4_temp1, h264_temp2, mp4_temp2, concat_file]:
+                if os.path.exists(f): os.remove(f)
+        else:
+            if os.path.exists(h264_temp1): os.remove(h264_temp1)
+
+# --- Start video buffering thread ---
+threading.Thread(target=video_buffer_loop, daemon=True).start()
+logger.info("System ready. Monitoring GPIO triggers...")
+
+# --- Main loop ---
+try:
+    while True:
+        val = {pin: dev.value for pin, dev in pins.items()}
+
+        if val[5] == 0 and val[6] == 1:
+            logger.info("Close squirrel detected!")
+            capture_thermal_image()
+            triggered.set()
+            time.sleep(5)
+
+        elif val[5] == 0 and val[22] == 1:
+            logger.info("Medium squirrel detected!")
+            capture_thermal_image()
+            triggered.set()
+            time.sleep(5)
+
+        elif val[5] == 0 and val[27] == 1:
+            logger.info("Far squirrel detected!")
+            capture_thermal_image()
+            triggered.set()
+            time.sleep(5)
+
+        time.sleep(0.2)
+
+except KeyboardInterrupt:
+    print("Shutting down...")
+
+finally:
+    mi48.stop(stop_timeout=1.5)
+    print("Thermal camera stopped.")
