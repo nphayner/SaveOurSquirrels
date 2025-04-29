@@ -1,0 +1,124 @@
+import os
+import time
+import logging
+import numpy as np
+import cv2 as cv
+from smbus import SMBus
+from spidev import SpiDev
+from gpiozero import DigitalInputDevice, DigitalOutputDevice
+from senxor.mi48 import MI48
+from senxor.utils import data_to_frame
+from senxor.interfaces import SPI_Interface, I2C_Interface
+
+# Configure logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
+
+# Save directory
+SAVE_DIRECTORY = "/home/sos/Pictures"
+os.makedirs(SAVE_DIRECTORY, exist_ok=True)
+
+def get_filename():
+    ts = time.strftime('%Y%m%d-%H%M%S', time.localtime())
+    return os.path.join(SAVE_DIRECTORY, f"thermal_image_{ts}.png")
+
+# MI48 Camera Setup
+RPI_GPIO_I2C_CHANNEL = 1
+RPI_GPIO_SPI_BUS = 0
+RPI_GPIO_SPI_CE_MI48 = 0
+MI48_I2C_ADDRESS = 0x40
+MI48_SPI_MODE = 0b00
+MI48_SPI_MAX_SPEED_HZ = 31200000
+MI48_SPI_CS_DELAY = 0.0001
+
+i2c = I2C_Interface(SMBus(RPI_GPIO_I2C_CHANNEL), MI48_I2C_ADDRESS)
+spi = SPI_Interface(SpiDev(RPI_GPIO_SPI_BUS, RPI_GPIO_SPI_CE_MI48), xfer_size=160)
+
+spi.device.mode = MI48_SPI_MODE
+spi.device.max_speed_hz = MI48_SPI_MAX_SPEED_HZ
+spi.cshigh = True
+spi.no_cs = True
+mi48_spi_cs_n = DigitalOutputDevice("BCM7", active_high=False, initial_value=False)
+
+mi48_reset_n = DigitalOutputDevice("BCM23", active_high=False, initial_value=True)
+mi48_data_ready = DigitalInputDevice("BCM24", pull_up=False)
+
+class MI48_reset:
+    def __init__(self, pin, assert_seconds=0.000035, deassert_seconds=0.050):
+        self.pin = pin
+        self.assert_time = assert_seconds
+        self.deassert_time = deassert_seconds
+
+    def __call__(self):
+        print('Resetting the MI48...')
+        self.pin.on()
+        time.sleep(self.assert_time)
+        self.pin.off()
+        time.sleep(self.deassert_time)
+        print('Done.')
+
+mi48 = MI48([i2c, spi], reset_handler=MI48_reset(pin=mi48_reset_n))
+mi48.set_fps(7)
+time.sleep(2)
+mi48.start(stream=True, with_header=True)
+logger.info("Camera is running. Watching GPIO pins for triggers...")
+
+# Define the GPIO pins for squirrel detection
+pins = {
+    5: DigitalInputDevice(5),
+    6: DigitalInputDevice(6),
+    22: DigitalInputDevice(22),
+    27: DigitalInputDevice(27)
+}
+
+def capture_and_save_image():
+    mi48_data_ready.wait_for_active()
+    logger.info("Capturing image...")
+
+    mi48_spi_cs_n.on()
+    time.sleep(MI48_SPI_CS_DELAY)
+    data, header = mi48.read()
+    mi48_spi_cs_n.off()
+
+    if data is None:
+        logger.critical("Error: No data received from camera")
+        return
+
+    imgh = data_to_frame(data, mi48.fpa_shape)
+
+    img8u = cv.normalize(imgh.astype('uint8'), None, 255, 0, norm_type=cv.NORM_MINMAX, dtype=cv.CV_8U)
+    img8u = cv.applyColorMap(img8u, cv.COLORMAP_JET)
+
+    filename = get_filename()
+    cv.imwrite(filename, img8u)
+    logger.info(f"Image saved: {filename}")
+
+try:
+    while True:
+        values = {pin: device.value for pin, device in pins.items()}
+
+        if values[5] == 0 and values[6] == 1:
+            print("Take close picture")
+            capture_and_save_image()
+            time.sleep(5)
+
+        elif values[5] == 0 and values[22] == 1:
+            print("Take medium picture")
+            capture_and_save_image()
+            time.sleep(5)
+
+        elif values[5] == 0 and values[27] == 1:
+            print("Take far picture")
+            capture_and_save_image()
+            time.sleep(5)
+
+        # Short delay to avoid rapid re-triggering (debounce)
+        time.sleep(0.2)
+
+except KeyboardInterrupt:
+    print("Exiting program...")
+
+finally:
+    mi48.stop(stop_timeout=1.5)
+    print("Camera shutdown complete.")
+
