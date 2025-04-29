@@ -1,0 +1,101 @@
+import subprocess
+import os
+import threading
+import time
+from datetime import datetime
+
+# Where to store final merged clips
+SAVE_DIR = "/home/sos/Videos"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# Temp location for buffering
+BUFFER_DIR = "/tmp/video_buffer"
+os.makedirs(BUFFER_DIR, exist_ok=True)
+
+triggered = False
+
+def listen_for_enter():
+    global triggered
+    while True:
+        try:
+            input()
+            triggered = True
+        except EOFError:
+            break
+
+# Start ENTER listener
+threading.Thread(target=listen_for_enter, daemon=True).start()
+
+print("Buffering 5-second video clips. Press ENTER to save + capture next 5 seconds.")
+
+while True:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    h264_temp1 = os.path.join(BUFFER_DIR, f"temp1_{timestamp}.h264")
+    mp4_temp1 = os.path.join(BUFFER_DIR, f"temp1_{timestamp}.mp4")
+    h264_temp2 = os.path.join(BUFFER_DIR, f"temp2_{timestamp}.h264")
+    mp4_temp2 = os.path.join(BUFFER_DIR, f"temp2_{timestamp}.mp4")
+    merged_output = os.path.join(SAVE_DIR, f"video_{timestamp}.mp4")
+
+    triggered = False  # reset for each loop
+
+    print(f"\nRecording buffered 5s clip: {timestamp}")
+    subprocess.run([
+        "libcamera-vid",
+        "-t", "5000",
+        "--width", "1920",
+        "--height", "1080",
+        "--framerate", "30",
+        "-n",
+        "-o", h264_temp1
+    ])
+
+    if triggered:
+        print("ENTER detected — saving and merging next segment...")
+
+        # Convert first temp clip
+        subprocess.run([
+            "ffmpeg", "-y", "-fflags", "+genpts", "-r", "30",
+            "-i", h264_temp1, "-c:v", "copy", mp4_temp1
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Record 2nd 5-second clip immediately after trigger
+        print("Recording additional 5s post-trigger...")
+        subprocess.run([
+            "libcamera-vid",
+            "-t", "5000",
+            "--width", "1920",
+            "--height", "1080",
+            "--framerate", "30",
+            "-n",
+            "-o", h264_temp2
+        ])
+
+        # Convert second temp clip
+        subprocess.run([
+            "ffmpeg", "-y", "-fflags", "+genpts", "-r", "30",
+            "-i", h264_temp2, "-c:v", "copy", mp4_temp2
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Make ffmpeg concat list
+        concat_list = os.path.join(BUFFER_DIR, "concat_list.txt")
+        with open(concat_list, "w") as f:
+            f.write(f"file '{mp4_temp1}'\n")
+            f.write(f"file '{mp4_temp2}'\n")
+
+        # Merge both mp4s into one
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", concat_list, "-c", "copy", merged_output
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        print(f"Merged video saved: {merged_output}")
+
+        # Clean up all temp files
+        for f in [h264_temp1, mp4_temp1, h264_temp2, mp4_temp2, concat_list]:
+            if os.path.exists(f):
+                os.remove(f)
+
+    else:
+        if os.path.exists(h264_temp1):
+            os.remove(h264_temp1)
+        print("No trigger — buffer discarded.")
